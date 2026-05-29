@@ -1,4 +1,4 @@
-# EVBox G2 ESPHome Autostart / Solar Surplus Controller
+# EVBox G2 ESPHome Controller
 
 ESPHome-based replacement/emulation controller for an EVBox G2 charge point using an M5Stack AtomS3 Lite and ATOMIC RS485 Base.
 
