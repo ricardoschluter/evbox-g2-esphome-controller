@@ -1,6 +1,6 @@
 secrets.yaml
 *.log
 *.bin
-.esphome/
 __pycache__/
 .DS_Store
+.vscode/

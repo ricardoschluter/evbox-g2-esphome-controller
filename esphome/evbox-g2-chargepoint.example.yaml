@@ -2,10 +2,13 @@ substitutions:
   device_name: evbox-g2-cp
   friendly_name: EVBox G2 Chargepoint
   grid_power_sensor_entity_id: sensor.your_grid_power_sensor
+  energy_price_sensor_entity_id: sensor.your_current_electricity_tariff
+  timezone: Europe/Amsterdam
 
 time:
   - platform: homeassistant
     id: ha_time
+    timezone: ${timezone}
 
 esphome:
   name: ${device_name}
@@ -18,8 +21,42 @@ esphome:
       - delay: 2s
 
       - lambda: |-
-          id(auto_start_enabled).publish_state(id(autostart_enabled) ? "Yes" : "No");
           id(charging_status).publish_state("Booting CP init sequence");
+
+          // Charging mode status herstellen op basis van global charging_mode
+          if (id(charging_mode) == 0) {
+            id(evbox_charging_mode_status).publish_state("Off");
+          } else if (id(charging_mode) == 1) {
+            id(evbox_charging_mode_status).publish_state("Manual");
+          } else if (id(charging_mode) == 2) {
+            id(evbox_charging_mode_status).publish_state("Auto");
+          } else if (id(charging_mode) == 3) {
+            id(evbox_charging_mode_status).publish_state("Solar Surplus");
+          } else {
+            id(evbox_charging_mode_status).publish_state("Unknown");
+          }
+
+          // Diagnose/defaults direct zichtbaar maken na reboot/flash
+          id(evbox_debug).publish_state("Booting - waiting for EVBox communication");
+          id(evbox_detected_generation).publish_state("Unknown");
+          id(evbox_config_raw).publish_state("Waiting for command 33 response");
+          id(evbox_meter_type).publish_state("Unknown");
+          id(evbox_auto_start_config).publish_state("Unknown");
+          id(evbox_remote_start_config).publish_state("Unknown");
+          id(evbox_config_profile).publish_state("Unknown");
+          id(evbox_current_rfid).publish_state("None");
+          id(evbox_session_rfid).publish_state("None");
+
+          if (id(last_rfid_id).empty()) {
+            id(evbox_last_rfid).publish_state("None");
+          } else {
+            id(evbox_last_rfid).publish_state(id(last_rfid_id));
+          }
+
+          id(evbox_communication_ok).publish_state(false);
+          id(evbox_is_charging).publish_state(false);
+          id(evbox_locked).publish_state(false);
+          id(evbox_session_active).publish_state(false);
 
       # 1. CP vraagt ChargeBox om opnieuw te registreren
       - lambda: |-
@@ -344,11 +381,6 @@ globals:
     restore_value: no
     initial_value: '"01"'
 
-  - id: autostart_enabled
-    type: bool
-    restore_value: yes
-    initial_value: 'true'
-
   - id: start_sent
     type: bool
     restore_value: no
@@ -460,6 +492,36 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+
+  - id: session_cost_eur
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: session_last_cost_meter_kwh
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: has_session_last_cost_meter
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: manual_start_requested
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: current_rfid_id
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: last_rfid_id
+    type: std::string
+    restore_value: yes
+    initial_value: '""'    
 
 # ==================== UART / RS485 ====================
 uart:
@@ -661,9 +723,23 @@ uart:
 
           // Command 22: Authorize card / autostart
           if (cmd == "22") {
-            bool is_auto_start_card = data.find("000000AS") != std::string::npos;
+            std::string rfid_id = data;
 
-            if (id(autostart_enabled)) {
+            if (data.size() > 2) {
+              rfid_id = data.substr(2);
+            }
+
+            bool is_auto_start_card = rfid_id.find("000000AS") != std::string::npos;
+
+            id(current_rfid_id) = rfid_id;
+            id(last_rfid_id) = rfid_id;
+
+            id(evbox_current_rfid).publish_state(rfid_id);
+            id(evbox_last_rfid).publish_state(rfid_id);
+
+            bool authorization_allowed = id(charging_mode) != 0;
+
+            if (authorization_allowed) {
               std::string response = "01";
               if (data.size() >= 2) {
                 response += data.substr(2);
@@ -671,7 +747,7 @@ uart:
               response += "FFFF";
 
               send_frame(src, "80", "22", response);
-              id(auto_start_enabled).publish_state(is_auto_start_card ? "Yes - auto card accepted" : "Yes - RFID accepted");
+              id(evbox_charging_mode_status).publish_state(is_auto_start_card ? "Authorization granted - auto card" : "Authorization granted - RFID");
               id(charging_status).publish_state("Authorization granted");
               publish_debug(is_auto_start_card ? "Autostart card accepted" : "RFID accepted", 2);
             } else {
@@ -682,9 +758,9 @@ uart:
               response += "FFFF";
 
               send_frame(src, "80", "22", response);
-              id(auto_start_enabled).publish_state("No");
-              id(charging_status).publish_state("Authorization denied");
-              publish_debug("Authorization denied because autostart is disabled", 2);
+              id(evbox_charging_mode_status).publish_state("No");
+              id(charging_status).publish_state("Authorization denied - charging mode Off");
+              publish_debug("Authorization denied because charging mode is Off", 2);
             }
             return;
           }
@@ -694,12 +770,20 @@ uart:
 
             id(start_sent) = true;
             id(session_active) = true;
+            id(evbox_session_rfid).publish_state(id(current_rfid_id));
             id(has_session_start_meter) = false;
             id(session_energy_kwh) = 0.0f;
             id(session_solar_surplus_energy_kwh) = 0.0f;
             id(session_grid_energy_kwh) = 0.0f;
             id(session_last_update_ms) = millis();
             id(session_start_ms) = millis();
+
+            id(session_cost_eur) = 0.0f;
+            id(session_last_cost_meter_kwh) = 0.0f;
+            id(has_session_last_cost_meter) = false;
+
+            id(evbox_session_cost).publish_state(0.0f);
+            id(evbox_session_average_price).publish_state(0.0f);
 
             auto now = id(ha_time).now();
             char session_id[32];
@@ -789,8 +873,10 @@ uart:
               id(evbox_last_session_solar_surplus_share).publish_state(solar_share);
             }
 
-            id(evbox_last_session_end_reason).publish_state("Remote stop accepted");
+            id(evbox_last_session_end_reason).publish_state("Metering ended");
+            id(evbox_last_session_cost).publish_state(id(session_cost_eur));
             publish_debug("Metering ended", 2);
+            id(manual_start_requested) = false;
             return;
           }
 
@@ -896,12 +982,40 @@ uart:
                   id(session_start_meter_kwh) = meter_kwh;
                   id(has_session_start_meter) = true;
                   id(evbox_session_energy).publish_state(0.0f);
+                  id(session_last_cost_meter_kwh) = meter_kwh;
+                  id(has_session_last_cost_meter) = true;
                 } else {
                   float session_energy = meter_kwh - id(session_start_meter_kwh);
 
                   if (session_energy >= 0.0f) {
                     id(session_energy_kwh) = session_energy;
                     id(evbox_session_energy).publish_state(session_energy);
+                    // Sessie-kosten op basis van meter-delta × actuele energieprijs.
+                    // Dit houdt rekening met prijswijzigingen tijdens de sessie.
+                    if (!id(has_session_last_cost_meter)) {
+                      id(session_last_cost_meter_kwh) = meter_kwh;
+                      id(has_session_last_cost_meter) = true;
+                    } else {
+                      float delta_cost_kwh = meter_kwh - id(session_last_cost_meter_kwh);
+
+                      if (delta_cost_kwh >= 0.0f && delta_cost_kwh < 10.0f) {
+                        if (!isnan(id(evbox_energy_price_input).state)) {
+                          float price_eur_per_kwh = id(evbox_energy_price_input).state;
+
+                          float delta_cost_eur = delta_cost_kwh * price_eur_per_kwh;
+
+                          id(session_cost_eur) += delta_cost_eur;
+                          id(session_last_cost_meter_kwh) = meter_kwh;
+
+                          id(evbox_session_cost).publish_state(id(session_cost_eur));
+
+                          if (id(session_energy_kwh) > 0.001f) {
+                            float avg_price = id(session_cost_eur) / id(session_energy_kwh);
+                            id(evbox_session_average_price).publish_state(avg_price);
+                          }
+                        }
+                      }
+                    }
                   }
                 }
 
@@ -963,6 +1077,15 @@ uart:
 
                   if (power_kw >= 0.0f && power_kw <= 30.0f) {
                     id(evbox_estimated_power).publish_state(power_kw);
+                    float phases = id(evbox_solar_charging_phases).state;
+                    if (phases < 1.0f) phases = 1.0f;
+                    if (phases > 3.0f) phases = 3.0f;
+
+                    float estimated_current_a = (power_kw * 1000.0f) / (230.0f * phases);
+
+                    if (estimated_current_a >= 0.0f && estimated_current_a <= 80.0f) {
+                      id(evbox_estimated_charging_current).publish_state(estimated_current_a);
+                    }
                   }
                 }
               }
@@ -1019,6 +1142,15 @@ uart:
                   i3 >= 0.0f && i3 < 100.0f) {
                 float power_kw = ((v1 * i1) + (v2 * i2) + (v3 * i3)) / 1000.0f;
                 id(evbox_estimated_power).publish_state(power_kw);
+                float phases = id(evbox_solar_charging_phases).state;
+                if (phases < 1.0f) phases = 1.0f;
+                if (phases > 3.0f) phases = 3.0f;
+
+                float estimated_current_a = (power_kw * 1000.0f) / (230.0f * phases);
+
+                if (estimated_current_a >= 0.0f && estimated_current_a <= 80.0f) {
+                  id(evbox_estimated_charging_current).publish_state(estimated_current_a);
+                }
               }
             }
 
@@ -1026,22 +1158,6 @@ uart:
               send_frame(src, "80", "26", "0000000000000000");
             } else {
               send_frame(src, "80", "26", "00000000");
-            }
-
-            // G2 autostart: state 17 lijkt "In use / plugged".
-            if (id(autostart_enabled) && !id(start_sent) && state == "17") {
-              send_frame(src, "80", "6B", "01003C00A000A000A0");
-              id(start_sent) = true;
-              id(charging_status).publish_state("Start charging sent after G2 state 17");
-              publish_debug("Start charging sent via command 6B after command 26 state 17", 2);
-            }
-
-            // G3-like ready state
-            if (id(autostart_enabled) && !id(start_sent) && state == "4A") {
-              send_frame(src, "80", "6B", "01003C00A000A000A0");
-              id(start_sent) = true;
-              id(charging_status).publish_state("Start charging sent after command 26 state 4A");
-              publish_debug("Start charging sent via command 6B after command 26 state 4A", 2);
             }
 
             return;
@@ -1069,8 +1185,9 @@ uart:
               id(charging_status).publish_state("G2 state 07 - authorized / ready");
               publish_debug("Charging state: G2 state 07 - authorized / ready", 2);
 
-              if (id(autostart_enabled) && !id(start_sent)) {
+              if ((id(manual_start_requested) || id(charging_mode) == 2 || id(charging_mode) == 3) && !id(start_sent)) {
                 id(start_sent) = true;
+                id(manual_start_requested) = false;
                 id(delayed_g2_start).execute();
                 id(charging_status).publish_state("Delayed start scheduled after G2 6A state 07");
                 publish_debug("Delayed command 6B scheduled after command 6A state 07", 2);
@@ -1093,7 +1210,7 @@ uart:
               id(charging_status).publish_state("Ready");
               publish_debug("Charging state: Ready", 2);
 
-              if (id(autostart_enabled) && !id(start_sent)) {
+              if ((id(charging_mode) == 2 || id(charging_mode) == 3) && !id(start_sent)) {
                 send_frame(src, "80", "6B", "01003C00A000A000A0");
                 id(start_sent) = true;
                 id(charging_status).publish_state("Start charging sent after 6A state A7");
@@ -1141,51 +1258,53 @@ uart:
           // Command 32: Remote stop response
           if (cmd == "32") {
             publish_debug("Command 32 remote stop response: " + data, 2);
-
             if (data == "01") {
               id(start_sent) = false;
               id(evbox_is_charging).publish_state(false);
               id(charging_status).publish_state("Remote stop accepted");
+
+              auto now = id(ha_time).now();
+
+              if (now.is_valid()) {
+                char end_time[32];
+                snprintf(
+                  end_time,
+                  sizeof(end_time),
+                  "%04d-%02d-%02d %02d:%02d:%02d",
+                  now.year,
+                  now.month,
+                  now.day_of_month,
+                  now.hour,
+                  now.minute,
+                  now.second
+                );
+
+                id(evbox_last_session_end_time).publish_state(std::string(end_time));
+              }
+
+              id(session_active) = false;
+              id(evbox_session_active).publish_state(false);
+
+              id(evbox_last_session_id).publish_state(id(current_session_id));
+              id(evbox_last_session_energy).publish_state(id(session_energy_kwh));
+              id(evbox_last_session_solar_surplus_energy).publish_state(id(session_solar_surplus_energy_kwh));
+              id(evbox_last_session_cost).publish_state(id(session_cost_eur));
+
+              if (id(session_energy_kwh) > 0.01f) {
+                float solar_share = (id(session_solar_surplus_energy_kwh) / id(session_energy_kwh)) * 100.0f;
+                if (solar_share < 0.0f) solar_share = 0.0f;
+                if (solar_share > 100.0f) solar_share = 100.0f;
+                id(evbox_last_session_solar_surplus_share).publish_state(solar_share);
+              }
+
+              id(evbox_last_session_end_reason).publish_state("Remote stop accepted");
+
             } else if (data == "23") {
               id(charging_status).publish_state("Remote stop failed / already stopped");
             } else {
               id(charging_status).publish_state("Remote stop response " + data);
             }
-
-            auto now = id(ha_time).now();
-
-            if (now.is_valid()) {
-              char end_time[32];
-              snprintf(
-                end_time,
-                sizeof(end_time),
-                "%04d-%02d-%02d %02d:%02d:%02d",
-                now.year,
-                now.month,
-                now.day_of_month,
-                now.hour,
-                now.minute,
-                now.second
-              );
-
-              id(evbox_last_session_end_time).publish_state(std::string(end_time));
-            }
-
-            id(session_active) = false;
-            id(evbox_session_active).publish_state(false);
-
-            id(evbox_last_session_id).publish_state(id(current_session_id));
-            id(evbox_last_session_energy).publish_state(id(session_energy_kwh));
-            id(evbox_last_session_solar_surplus_energy).publish_state(id(session_solar_surplus_energy_kwh));
-
-            if (id(session_energy_kwh) > 0.01f) {
-              float solar_share = (id(session_solar_surplus_energy_kwh) / id(session_energy_kwh)) * 100.0f;
-              if (solar_share < 0.0f) solar_share = 0.0f;
-              if (solar_share > 100.0f) solar_share = 100.0f;
-              id(evbox_last_session_solar_surplus_share).publish_state(solar_share);
-            }
-
-            id(evbox_last_session_end_reason).publish_state("Remote stop accepted");
+            id(manual_start_requested) = false;
             return;
           }
 
@@ -1318,6 +1437,8 @@ script:
           };
 
           send_frame(id(cb_address), "80", "6B", "01003C00A000A000A0");
+          id(last_sent_current_tenths) = 160;
+          id(evbox_charge_current_limit).publish_state(16.0f);
           id(charging_status).publish_state("Delayed G2 start/current limit sent");
           id(evbox_debug).publish_state("Delayed G2 start sent via command 6B");
 
@@ -1497,6 +1618,7 @@ script:
           }
 
           id(last_sent_current_tenths) = new_current_tenths;
+          id(evbox_charge_current_limit).publish_state(new_current_tenths / 10.0f);
 
           char current_hex[5];
           snprintf(current_hex, sizeof(current_hex), "%04X", new_current_tenths);
@@ -1655,23 +1777,19 @@ select:
       - lambda: |-
           if (x == "Off") {
             id(charging_mode) = 0;
-            id(autostart_enabled) = false;
-            id(auto_start_enabled).publish_state("Off");
+            id(evbox_charging_mode_status).publish_state("Off");
             id(charging_status).publish_state("Charging mode: Off");
           } else if (x == "Manual") {
             id(charging_mode) = 1;
-            id(autostart_enabled) = false;
-            id(auto_start_enabled).publish_state("Manual");
+            id(evbox_charging_mode_status).publish_state("Manual");
             id(charging_status).publish_state("Charging mode: Manual");
           } else if (x == "Auto") {
             id(charging_mode) = 2;
-            id(autostart_enabled) = true;
-            id(auto_start_enabled).publish_state("Auto");
+            id(evbox_charging_mode_status).publish_state("Auto");
             id(charging_status).publish_state("Charging mode: Auto");
           } else if (x == "Solar Surplus") {
             id(charging_mode) = 3;
-            id(autostart_enabled) = true;
-            id(auto_start_enabled).publish_state("Solar Surplus");
+            id(evbox_charging_mode_status).publish_state("Solar Surplus");
             id(charging_status).publish_state("Charging mode: Solar Surplus");
           }
 
@@ -1795,9 +1913,9 @@ text_sensor:
     icon: "mdi:ev-station"
 
   - platform: template
-    name: "EVBox Auto Start"
-    id: auto_start_enabled
-    icon: "mdi:power"
+    name: "EVBox Charging Mode Status"
+    id: evbox_charging_mode_status
+    icon: "mdi:ev-station"
 
   - platform: template
     name: "EVBox Debug"
@@ -1871,6 +1989,21 @@ text_sensor:
     name: "EVBox Last Session End Reason"
     id: evbox_last_session_end_reason
     icon: "mdi:ev-station"
+
+  - platform: template
+    name: "EVBox Current RFID"
+    id: evbox_current_rfid
+    icon: "mdi:card-account-details-outline"
+
+  - platform: template
+    name: "EVBox Last RFID"
+    id: evbox_last_rfid
+    icon: "mdi:card-account-details-outline"
+
+  - platform: template
+    name: "EVBox Session RFID"
+    id: evbox_session_rfid
+    icon: "mdi:card-account-details-outline"
 
 # ==================== BINARY SENSOREN ====================
 binary_sensor:
@@ -2046,24 +2179,49 @@ sensor:
     accuracy_decimals: 0
     icon: "mdi:timer-outline"
 
-# ==================== SCHAKELAARS ====================
-switch:
   - platform: template
-    name: "EVBox Allow Autostart"
-    id: auto_start_switch
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    turn_on_action:
-      - lambda: |-
-          id(autostart_enabled) = true;
-          id(auto_start_enabled).publish_state("Yes");
-          ESP_LOGD("evbox", "Autostart allowed");
-    turn_off_action:
-      - lambda: |-
-          id(autostart_enabled) = false;
-          id(start_sent) = false;
-          id(auto_start_enabled).publish_state("No");
-          ESP_LOGD("evbox", "Autostart blocked");
+    name: "EVBox Charge Current Limit"
+    id: evbox_charge_current_limit
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+
+  - platform: template
+    name: "EVBox Estimated Charging Current"
+    id: evbox_estimated_charging_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+
+  - platform: homeassistant
+    name: "EVBox Energy Price Input"
+    id: evbox_energy_price_input
+    entity_id: ${energy_price_sensor_entity_id}
+    unit_of_measurement: "EUR/kWh"
+    internal: false
+
+  - platform: template
+    name: "EVBox Session Cost"
+    id: evbox_session_cost
+    unit_of_measurement: "€"
+    accuracy_decimals: 2
+    icon: "mdi:currency-eur"
+
+  - platform: template
+    name: "EVBox Last Session Cost"
+    id: evbox_last_session_cost
+    unit_of_measurement: "€"
+    accuracy_decimals: 2
+    icon: "mdi:currency-eur"
+
+  - platform: template
+    name: "EVBox Session Average Price"
+    id: evbox_session_average_price
+    unit_of_measurement: "EUR/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:cash-clock"
 
 # ==================== BUTTONS ====================
 button:
@@ -2114,6 +2272,7 @@ button:
             return;
           }
 
+          id(manual_start_requested) = true;
           id(start_sent) = false;
           id(last_sent_current_tenths) = 0;
           id(solar_import_over_limit_since_ms) = 0;
