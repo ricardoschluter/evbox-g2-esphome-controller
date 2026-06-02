@@ -9,11 +9,6 @@ ESPHome-based replacement/emulation controller for an EVBox G2 charge point usin
 - Delayed G2 start via 6A state 07 → command 6B
 - Remote stop via command 32
 - Home Assistant controls
-- Charging modes:
-  - Off
-  - Manual
-  - Auto
-  - Solar Surplus
 - Solar surplus feedback control using grid power
 - Session tracking:
   - session id
@@ -22,6 +17,34 @@ ESPHome-based replacement/emulation controller for an EVBox G2 charge point usin
   - duration
   - energy
   - estimated solar surplus share
+
+## Charging modes
+
+The controller uses a single `EVBox Charging Mode` selector as the main start-control mechanism.
+
+| Mode | Authorization | Start behavior | Dynamic current control |
+|---|---|---|---|
+| Off | Denied | No start allowed | No |
+| Manual | Allowed | Only starts after pressing the Home Assistant `EVBox Start Charging` button | No |
+| Auto | Allowed | Starts automatically after RFID/card authorization | No |
+| Solar Surplus | Allowed | Starts automatically after RFID/card authorization | Yes |
+
+### Manual mode
+
+In `Manual` mode, RFID/card authorization is accepted, but the controller will not automatically send the EVBox start/current-limit command.  
+A charging session is only started when the `EVBox Start Charging` button is pressed in Home Assistant.
+
+### Auto mode
+
+In `Auto` mode, the controller accepts RFID/card authorization and automatically continues the proven EVBox G2 start flow:
+
+```text
+RFID/card authorization
+→ command 22 accepted
+→ command 6A state 07
+→ delayed command 6B
+→ command 23 metering started
+→ command 26 state 17
 
 ## Hardware
 
