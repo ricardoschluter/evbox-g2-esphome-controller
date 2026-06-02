@@ -45,7 +45,7 @@ RFID/card authorization
 → delayed command 6B
 → command 23 metering started
 → command 26 state 17
-
+```
 ## Hardware
 
 - M5Stack AtomS3 Lite
