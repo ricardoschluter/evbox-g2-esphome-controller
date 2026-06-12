@@ -13,7 +13,7 @@ time:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
-  comment: M5Stack AtomS3 EVBox Autostart + Debug
+  comment: M5Stack AtomS3 EVBox G2 Chargepoint + Debug
 
   on_boot:
     priority: -100
@@ -344,7 +344,7 @@ esphome:
           };
 
           send_frame(id(cb_address), "80", "18", "02");
-          id(delayed_get_configuration).execute();
+          //id(delayed_get_configuration).execute();
           id(evbox_debug).publish_state("Late boot: requested state update and scheduled configuration");
 
 esp32:
@@ -359,15 +359,16 @@ logger:
 
 api:
   encryption:
-    key: !secret evbox_autostart_api_key
+    key: !secret evbox_controller_api_key
 
 ota:
   - platform: esphome
-    password: !secret evbox_autostart_ota_password
+    password: !secret evbox_controller_ota_password
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  min_auth_mode: WPA2
 
   ap:
     ssid: "${friendly_name} Fallback"
@@ -1437,6 +1438,8 @@ script:
           };
 
           send_frame(id(cb_address), "80", "6B", "01003C00A000A000A0");
+          //send_frame("80", "A0", "69", "00A000A000A0003C00A000A000A0");
+          //id(evbox_debug).publish_state("Sent SmartGrid command 69 current limit 16A after 6B", 2);
           id(last_sent_current_tenths) = 160;
           id(evbox_charge_current_limit).publish_state(16.0f);
           id(charging_status).publish_state("Delayed G2 start/current limit sent");
@@ -1735,6 +1738,41 @@ interval:
 
           if (millis() - id(last_valid_rx_ms) > 120000UL) {
             id(evbox_communication_ok).publish_state(false);
+          }
+
+  - interval: 30s
+    then:
+      - lambda: |-
+          if ((id(charging_mode) == 1 || id(charging_mode) == 2) && id(evbox_is_charging).state) {
+            auto send_frame = [&](std::string dst, std::string src, std::string cmd, std::string data) {
+              std::string payload = dst + src + cmd + data;
+
+              uint8_t checksum = 0;
+              uint8_t parity = 0;
+
+              for (char c : payload) {
+                checksum += (uint8_t)c;
+                parity ^= (uint8_t)c;
+              }
+
+              char cs[3];
+              char pa[3];
+              snprintf(cs, sizeof(cs), "%02X", checksum);
+              snprintf(pa, sizeof(pa), "%02X", parity);
+
+              std::string frame = "\x02" + payload + std::string(cs) + std::string(pa) + "\x03\xFF";
+              id(uart_evbox).write_array((const uint8_t*) frame.data(), frame.size());
+
+              ESP_LOGD("evbox", "TX payload: %s", payload.c_str());
+            };
+
+            send_frame(id(cb_address), "80", "6B", "01003C00A000A000A0");
+            //send_frame("80", "A0", "69", "00A000A000A0003C00A000A000A0");
+            //id(evbox_debug).publish_state("Sent SmartGrid command 69 current limit 16A after 6B", 2);
+
+            id(last_sent_current_tenths) = 160;
+            id(evbox_charge_current_limit).publish_state(16.0f);
+            id(evbox_debug).publish_state("Keepalive: repeated 6B current limit 16A");
           }
 
 # ==================== HOME ASSISTANT CONTROLS ====================

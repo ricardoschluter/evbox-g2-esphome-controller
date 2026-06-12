@@ -1,1 +1,115 @@
-Will be added later
+###############################################################################
+# EVBox G2 session logging
+###############################################################################
+
+template:
+  - sensor:
+      - name: "EVBox Session Summary"
+        unique_id: evbox_session_summary
+        icon: mdi:ev-station
+        state: >
+          {% set active = states('binary_sensor.evbox-g2-cp_evbox_session_active') %}
+          {% set energy = states('sensor.evbox-g2-cp_evbox_session_energy') | float(0) | round(3) %}
+          {% set cost = states('sensor.evbox-g2-cp_evbox_session_cost') | float(0) | round(2) %}
+          {% set current = states('sensor.evbox-g2-cp_evbox_estimated_charging_current') | float(0) | round(1) %}
+          {% if active == 'on' %}
+            Active - {{ energy }} kWh - {{ current }} A - €{{ cost }}
+          {% else %}
+            Idle - last {{ states('sensor.evbox-g2-cp_evbox_last_session_energy') | float(0) | round(3) }} kWh - €{{ states('sensor.evbox-g2-cp_evbox_last_session_cost') | float(0) | round(2) }}
+          {% endif %}
+
+      - name: "EVBox Current Session Cost Rounded"
+        unique_id: evbox_current_session_cost_rounded
+        icon: mdi:currency-eur
+        unit_of_measurement: "€"
+        state: >
+          {{ states('sensor.evbox-g2-cp_evbox_session_cost') | float(0) | round(2) }}
+
+      - name: "EVBox Current Session Energy Rounded"
+        unique_id: evbox_current_session_energy_rounded
+        icon: mdi:lightning-bolt
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: total
+        state: >
+          {{ states('sensor.evbox-g2-cp_evbox_session_energy') | float(0) | round(3) }}
+
+      - name: "EVBox Current Session Solar Share Rounded"
+        unique_id: evbox_current_session_solar_share_rounded
+        icon: mdi:solar-power-variant
+        unit_of_measurement: "%"
+        state: >
+          {{ states('sensor.evbox-g2-cp_evbox_session_solar_surplus_share') | float(0) | round(1) }}
+
+automation:
+  - id: evbox_log_session_started
+    alias: "EVBox - Log session started"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.evbox-g2-cp_evbox_session_active
+        from: "off"
+        to: "on"
+    action:
+      - service: logbook.log
+        data:
+          name: "EVBox"
+          message: >
+            Charging session started.
+            RFID={{ states('sensor.evbox-g2-cp_evbox_session_rfid') }},
+            Session={{ states('sensor.evbox-g2-cp_evbox_current_session_id') }}.
+          entity_id: binary_sensor.evbox-g2-cp_evbox_session_active
+
+  - id: evbox_log_session_finished
+    alias: "EVBox - Log session finished"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.evbox-g2-cp_evbox_session_active
+        from: "on"
+        to: "off"
+    action:
+      - service: logbook.log
+        data:
+          name: "EVBox"
+          message: >
+            Charging session finished.
+            Energy={{ states('sensor.evbox-g2-cp_evbox_last_session_energy') | float(0) | round(3) }} kWh,
+            Cost=€{{ states('sensor.evbox-g2-cp_evbox_last_session_cost') | float(0) | round(2) }},
+            Solar={{ states('sensor.evbox-g2-cp_evbox_last_session_solar_surplus_share') | float(0) | round(1) }}%,
+            RFID={{ states('sensor.evbox-g2-cp_evbox_session_rfid') }},
+            Reason={{ states('sensor.evbox-g2-cp_evbox_last_session_end_reason') }}.
+          entity_id: binary_sensor.evbox-g2-cp_evbox_session_active
+
+      - service: persistent_notification.create
+        data:
+          title: "EVBox charging session finished"
+          message: >
+            Energy: {{ states('sensor.evbox-g2-cp_evbox_last_session_energy') | float(0) | round(3) }} kWh
+
+            Cost: €{{ states('sensor.evbox-g2-cp_evbox_last_session_cost') | float(0) | round(2) }}
+
+            Solar share: {{ states('sensor.evbox-g2-cp_evbox_last_session_solar_surplus_share') | float(0) | round(1) }}%
+
+            RFID: {{ states('sensor.evbox-g2-cp_evbox_session_rfid') }}
+
+            End reason: {{ states('sensor.evbox-g2-cp_evbox_last_session_end_reason') }}
+
+      - action: notify.send_message
+        target:
+          entity_id: notify.file
+        data:
+          message: >-
+            {{ now().strftime('%Y-%m-%d %H:%M:%S') }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_id') }},
+            {{ states('sensor.evbox-g2-cp_evbox_session_start_time') }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_end_time') }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_end_reason') }},
+            {{ states('sensor.evbox-g2-cp_evbox_session_rfid') }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_energy') | float(0) | round(3) }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_cost') | float(0) | round(2) }},
+            {{ states('sensor.evbox-g2-cp_evbox_session_average_price') | float(0) | round(4) }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_solar_surplus_energy') | float(0) | round(3) }},
+            {{ states('sensor.evbox-g2-cp_evbox_session_grid_energy') | float(0) | round(3) }},
+            {{ states('sensor.evbox-g2-cp_evbox_last_session_solar_surplus_share') | float(0) | round(1) }},
+            {{ states('sensor.evbox-g2-cp_evbox_session_duration') | float(0) | round(0) }}
